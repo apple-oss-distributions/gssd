@@ -78,6 +78,8 @@
 
 #include <Heimdal/com_err.h>
 #include <Heimdal/krb5.h>
+#include <Security/Security.h>
+#include <Security/SecBasePriv.h>
 #include <GSS/gssapi.h>
 #include <GSS/gssapi_krb5.h>
 #include <GSS/gssapi_ntlm.h>
@@ -89,6 +91,12 @@
 #include "gssd_machServer.h"
 
 mach_port_t gssd_receive_right;
+
+#include <os/log.h>
+#include <os/log_private.h>
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 union MaxMsgSize {
 	union __RequestUnion__gssd_mach_subsystem req;
@@ -279,6 +287,7 @@ check_session(au_asid_t asid)
 	return (TRUE);
 }
 
+
 au_asid_t my_asid = AU_DEFAUDITSID;
 #ifdef CCOVERAGE
 #include <sys/types.h>
@@ -315,6 +324,8 @@ set_identity(void)
 			chmod(path, 0666);
 			chown(path, uid, 0);
 #endif
+
+			_SecSetSecuritydTargetUID(uid);
 			if (join_session(asid, instance) == 0)
 				setuid(uid);
 		}
@@ -386,6 +397,8 @@ int main(int argc, char *argv[])
 	int ch;
 	int debug_opt = 0;
 
+	/* Tell logd we're special */
+	os_log_set_client_type(OS_LOG_CLIENT_TYPE_LOGD_DEPENDENCY, 0);
 	/* If launchd is redirecting these to files they'll be blocked */
 	/* buffered. Probably not what you want. */
 	setlinebuf(stdout);
@@ -467,7 +480,7 @@ int main(int argc, char *argv[])
 	/* Check to see if the master asl filter is set */
 	set_debug_level(-1);
 
-	/* Set our session and uid if needed */
+	/* Set our session, uid and securityd lookup target if needed */
 	set_identity();
 
 	gssd_init();
@@ -1489,7 +1502,7 @@ vm_alloc_buffer(gss_buffer_t buf, uint8_t **value, uint32_t *len)
 	if (buf->length == 0)
 		return;
 	kr = vm_allocate(mach_task_self(),
-			(vm_address_t *)value, buf->length, VM_FLAGS_ANYWHERE);
+			 (vm_address_t *)value, buf->length, VM_FLAGS_ANYWHERE);
 	if (kr != KERN_SUCCESS) {
 		Log("Could not allocate vm in vm_alloc_buffer\n");
 		return;
@@ -2269,8 +2282,12 @@ svc_mach_gss_init_sec_context_common(
 					  ret_flags,		/* Returned flag bits */
 					  NULL);		/* Time valid */
 
-	vm_alloc_buffer(&outtoken, otoken, otokenCnt);
-	gss_release_buffer(&minor, &outtoken);
+	if (major_stat == GSS_S_COMPLETE || major_stat == GSS_S_CONTINUE_NEEDED) {
+		/* Set up OOL buffer for the otoken */
+		vm_alloc_buffer(&outtoken, otoken, otokenCnt);
+		/* and release our gss buffer */
+		gss_release_buffer(&minor, &outtoken);
+	}
 
 	if (major_stat == GSS_S_COMPLETE) {
 		/*
@@ -2464,7 +2481,7 @@ svc_mach_gss_init_sec_context_v3(
 	mach_msg_type_number_t *skeyCnt,
 	gssd_byte_buffer *otoken,
 	mach_msg_type_number_t *otokenCnt,
-	 gssd_dstring displayname,
+	gssd_dstring displayname,
 	uint32_t *major_stat,
 	uint32_t *minor_stat)
 {
@@ -2479,15 +2496,14 @@ svc_mach_gss_init_sec_context_v3(
 	gssd_vproc_handle = vproc_transaction_begin(NULL);
 	new_worker_thread();
 
-	/*
-	 * Coverity is complaining that major_stat and minor_stat are
-	 * not initialize. Since these are out only parameters, mig
-	 * initializes them to zero, but Coverity dosn't grok that. If
-	 * we ever make major_stat and minor_stat in/out parameters we
-	 * should remove the next two lines.
-	 */
+	/* Initialize all output paramaters for MIG */
 	*major_stat = GSS_S_COMPLETE;
 	*minor_stat = 0;
+	if (displayname)
+		*displayname = '\0';
+	*otokenCnt = *skeyCnt = 0;
+	*skey = *otoken = NULL;
+	*ret_flags = 0;
 
 	svc_gss_name = GSS_C_NO_NAME;
 
@@ -2495,9 +2511,6 @@ svc_mach_gss_init_sec_context_v3(
 		kr = KERN_NO_ACCESS;
 		goto out;
 	}
-
-	if (displayname)
-		*displayname = '\0';
 
 	if (gss_context == NULL || cred_handle == NULL ||
 	    !gssd_check(CAST(void *, *gss_context)) || !gssd_check(CAST(void *, *cred_handle))) {
@@ -2739,15 +2752,22 @@ svc_mach_gss_accept_sec_context_v2(
 	gssd_vproc_handle = vproc_transaction_begin(NULL);
 	new_worker_thread();
 
+	/* Initailize all output parameters to sane values for MIG */
+	*major_stat = *minor_stat = 0;
+	*otokenCnt = *skeyCnt = 0;
+	*skey = *otoken = NULL;
+	/* Set the uid/gid to nobody to be safe */
+	*uid = NobodyUid;
+	*gidsCnt = 1;
+	*gids = NobodyGid;
+	*ret_flags = 0;
+
 	if (!check_audit(atok, FALSE)) {
 		kr = KERN_NO_ACCESS;
 		goto out;
 	}
 
 	*inout_gssd_flags = 0;
-
-	/* Set the uid to nobody to be safe */
-	*uid = NobodyUid;
 
 	if (die) {
 		Debug("Forced server death\n");
@@ -2769,8 +2789,6 @@ svc_mach_gss_accept_sec_context_v2(
 	g_cntx = gssd_get_context(*gss_context, NULL);
 	gss_buffer_desc intoken = {itokenCnt, itoken};
 	gss_buffer_desc outtoken = {0, NULL};;
-	*major_stat = 0;
-	*minor_stat = 0;
 
 	DEBUG(4, "minor_stat = %d\n", (int) *minor_stat);
 	DEBUG(4, "\tcred = %p\n", (void *)(uintptr_t)*cred_handle);
@@ -2791,8 +2809,10 @@ svc_mach_gss_accept_sec_context_v2(
 					     NULL,				// Time requirement
 					     NULL);				// Delegated creds
 
-	vm_alloc_buffer(&outtoken, otoken, otokenCnt);
-	gss_release_buffer(&mstat, &outtoken);
+	if (*major_stat == GSS_S_CONTINUE_NEEDED || *major_stat == GSS_S_COMPLETE) {
+		vm_alloc_buffer(&outtoken, otoken, otokenCnt);
+		gss_release_buffer(&mstat, &outtoken);
+	}
 
 	if (*major_stat == GSS_S_COMPLETE ) {
 		/*
@@ -2965,6 +2985,8 @@ svc_mach_gss_hold_cred(mach_port_t server __unused,
 	gssd_vproc_handle = vproc_transaction_begin(NULL);
 	new_worker_thread();
 
+	*major_stat = *minor_stat = 0;
+
 	if (!check_audit(atok, FALSE)) {
 		kr = KERN_NO_ACCESS;
 		goto out;
@@ -3002,6 +3024,8 @@ svc_mach_gss_unhold_cred(mach_port_t server __unused,
 	gssd_vproc_handle = vproc_transaction_begin(NULL);
 	new_worker_thread();
 
+	*major_stat = *minor_stat = 0;
+
 	if (!check_audit(atok, FALSE)) {
 		kr = KERN_NO_ACCESS;
 		goto out;
@@ -3026,7 +3050,7 @@ svc_mach_gss_lookup(mach_port_t server,
 		    audit_token_t atok,
 		    mach_port_t *gssd_port)
 {
-	kern_return_t kr = KERN_SUCCESS;
+	kern_return_t kr = KERN_NO_ACCESS;
 	uuid_t uuid;
 	uuid_string_t uuidstr;
 	vproc_transaction_t gssd_vproc_handle;
@@ -3035,27 +3059,32 @@ svc_mach_gss_lookup(mach_port_t server,
 	gssd_vproc_handle = vproc_transaction_begin(NULL);
 	new_worker_thread();
 
-	if (!check_audit(atok, kernel_only)) {
-		kr = KERN_NO_ACCESS;
-		goto out;
-	}
-
 	*gssd_port = MACH_PORT_NULL;
-	if (!check_session(asid)) {
-		*gssd_port = server;
-	} else {
-		sessioninfo2uuid((uid_t)uid, (au_asid_t)asid, uuid);
-		uuid_unparse(uuid, uuidstr);
-		Debug("Looking up %s for %d %d as instance %s", bname, uid, asid, uuidstr);
+	if (!check_audit(atok, kernel_only))
+		goto out;
 
-		kr = bootstrap_look_up3(bootstrap_port, bname, gssd_port, 0, uuid, BOOTSTRAP_SPECIFIC_INSTANCE);
-		if (kr != KERN_SUCCESS)
-			Log("Could not lookup per instance port %d: %s", kr, bootstrap_strerror(kr));
+	if (check_session(asid)) {
+		if (asid == my_asid) {
+			kr = mach_port_insert_right(mach_task_self(), server, server, MACH_MSG_TYPE_MAKE_SEND);
+			if (kr == KERN_SUCCESS)
+				*gssd_port = server;
+		} else {
+			sessioninfo2uuid((uid_t)uid, (au_asid_t)asid, uuid);
+			uuid_unparse(uuid, uuidstr);
+			Debug("Looking up %s for %d %d as instance %s", bname, uid, asid, uuidstr);
 
-		Debug("bootstap_look_up3 = %d port = %d,  server port = %d", kr, *gssd_port, server);
+			kr = bootstrap_look_up3(bootstrap_port, bname, gssd_port, 0, uuid, BOOTSTRAP_SPECIFIC_INSTANCE);
+			if (kr != KERN_SUCCESS)
+				Log("Could not lookup per instance port %d: %s", kr, bootstrap_strerror(kr));
+
+			Debug("bootstap_look_up3 = %d port = %d,  server port = %d", kr, *gssd_port, server);
+		}
 	}
+
 out:
 	end_worker_thread();
 	vproc_transaction_end(NULL, gssd_vproc_handle);
 	return (kr);
 }
+
+#pragma clang diagnostic pop
